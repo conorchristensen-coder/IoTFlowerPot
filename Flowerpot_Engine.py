@@ -1,7 +1,10 @@
 import RPi.GPIO as GPIO
 from StepperMotor_MODULE import StepperMotor
+from time import sleep,strftime
 import time, AHT20
 from ADC_PCF8591 import PCF8591
+import csv
+import requests
 
 
 
@@ -34,7 +37,7 @@ A2_chan = 0x42       # A2 input
 A3_chan = 0x43       # A3 input
 ADC = PCF8591(bus, ADC_address)
 
-# set up AHT20 device for temperature and humidity
+# set up AHT20 device for temperature andi humidity
 AHT20_address = 0x38   # AHT20 sensor board
 aht20 = AHT20.AHT20(bus, AHT20_address)
 
@@ -54,6 +57,45 @@ GPIO.setup(ButtonPin, GPIO.IN, pull_up_down=GPIO.PUD_UP)   # Set pin mode as inp
 GPIO.setup(LeftLim, GPIO.IN, pull_up_down=GPIO.PUD_UP)   # Set pin mode as input
 # Initialize Right limit switch
 GPIO.setup(RightLim, GPIO.IN, pull_up_down=GPIO.PUD_UP)   # Set pin mode as input
+
+global DATA_FILE
+global MOISTURE_THRESHOLD
+global NOAA_API_URL
+
+DATA_FILE = "light_log.csv"
+MOISTURE_THRESHOLD = 30  # Soil moisture threshold %
+NOAA_API_URL = "https://api.weather.gov/gridpoints/SEW/124,67/forecast"  # Replace with your local gridpoint
+
+
+try:
+    with open(DATA_FILE, 'x', newline='') as f:
+        writer = csv.writer(f)
+        writer.writerow(["Timestamp", "MaxLightPercent"])
+except FileExistsError:
+    pass  # File already exists
+
+# Weather station at the PDX Airport
+latitude = '45.5958'
+longitude = '-122.6093'
+office = 'PQR'
+gridX = '115'
+gridY = '106'
+
+# URL and query elements for the NOAA Web site
+base_url = 'https://api.weather.gov/gridpoints/'
+full_url = base_url + office + '/' + gridX + ',' + gridY + '/forecast'
+
+
+def fetchweatherdata(): 
+    # GET the response from the NWS server
+    response = requests.get(full_url)
+
+    # Format the response object as JSON
+    data = response.json()
+    global daytemp, sun
+    daytemp = data['properties']['periods'][0]['temperature']
+    sun = data['properties']['periods'][0]['shortForecast']
+    return (daytemp,sun)
 
 
 
@@ -163,3 +205,54 @@ def home_base():
     motor.rotate(90, 'CW', 's', 'full')
     return True
             
+    
+def sweep_and_optimize_light(step_deg, sweep_delay):
+    
+    
+    STEP_DEG = 5
+    SWEEP_DELAY = 0.5
+    SWEEP_INTERVAL = 20*60
+    MAX_DEGREES = 90   
+    
+      # Motor physical limits
+    """Sweep motor across full ±90° range, find highest light, move back, log it."""
+    # Move to leftmost limit
+    motor_pos = 0
+    while motor_pos > -MAX_DEGREES and not read_LeftLim():
+        motor.rotate(step_deg, 'CCW', 's', 'full')
+        motor_pos -= step_deg
+        sleep(0.05)
+
+    # Sweep right while recording light
+    sweep_positions = []
+    sweep_lights = []
+    current_pos = motor_pos
+    while current_pos < MAX_DEGREES and not read_RightLim():
+        light = read_Light()
+        sweep_positions.append(current_pos)
+        sweep_lights.append(light)
+        motor.rotate(step_deg, 'CW', 's', 'full')
+        current_pos += step_deg
+        sleep(sweep_delay)
+
+    # Find max light position
+    max_index = sweep_lights.index(max(sweep_lights))
+    best_pos = sweep_positions[max_index]
+    max_light = sweep_lights[max_index]
+    print(f"Max light {max_light}% at {best_pos}°")
+
+    # Move motor to best position
+    steps_to_move = best_pos - current_pos
+    if steps_to_move != 0:
+        direction = 'CW' if steps_to_move > 0 else 'CCW'
+        motor.rotate(abs(steps_to_move), direction, 's', 'full')
+        motor_pos = best_pos
+    print(f"Motor moved to optimal light position: {motor_pos}°")
+
+    # Log data to CSV
+    timestamp = strftime("%Y-%m-%d %H:%M:%S")
+    with open(DATA_FILE, 'a', newline='') as f:
+        writer = csv.writer(f)
+        writer.writerow([timestamp, max_light])
+    print(f"Logged data: {timestamp}, {max_light}%")
+    return max_light, timestamp
