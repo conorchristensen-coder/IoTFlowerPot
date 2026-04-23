@@ -1,0 +1,360 @@
+import RPi.GPIO as GPIO
+from StepperMotor_MODULE import StepperMotor
+from time import sleep,strftime
+import time, AHT20
+from ADC_PCF8591 import PCF8591
+import csv
+import requests
+import json, random
+
+# MQTT setup
+# -----------------------------
+iot_hub = "thingsboard.cloud"
+port = 1883
+cli_ID = f'clientID-{random.randint(0,1000)}'
+username = "1k06jk6MY3O3tpx1BE7Y"  # Replace with your key
+password = ""
+TelemetryTopic = "v1/devices/me/telemetry"
+RPCrequestTopic = 'v1/devices/me/rpc/request/+'
+AttributesTopic = "v1/devices/me/attributes"
+
+# This module contains all initializations and functions
+# for the smart Flowerpot
+
+# Devices (pins are for the LAB prototype)
+WaterLevelPin = 12    # Pin number on the header (GPIO 18)
+PumpPin = 36    # Pin number on the header (GPIO 16)
+LedPin = 8    # Pin number on the header (UART0 TX)
+ButtonPin = 16   # Pin number on the header (GPIO 23)
+LeftLim = 7    # Pin number on the header (GPIO 4)
+RightLim = 18   # Pin number on the header (GPIO 24)
+
+# Define LED state variable
+ledON = False
+
+# Define motor
+motor = StepperMotor()
+motor.printOutput = False
+
+# I2C bus connections for ADC and AHT20
+bus = 1
+
+# set up the ADC device
+ADC_address = 0x48   # ADC board
+A0_chan = 0x40       # A0 input    (Light sensor)
+A1_chan = 0x41       # A1 input    (Soil misture sensor)
+A2_chan = 0x42       # A2 input
+A3_chan = 0x43       # A3 input
+ADC = PCF8591(bus, ADC_address)
+
+# set up AHT20 device for temperature andi humidity
+AHT20_address = 0x38   # AHT20 sensor board
+aht20 = AHT20.AHT20(bus, AHT20_address)
+
+# Initialize GPIO
+GPIO.setmode(GPIO.BOARD)    # Number GPIOs by its physical location
+GPIO.setwarnings(False)     # Turn of GPIO warnings
+
+# Initialize water level sensor
+GPIO.setup(WaterLevelPin, GPIO.IN, pull_up_down=GPIO.PUD_UP)   # Set pin mode as input
+# Initialize pump relay
+GPIO.setup(PumpPin, GPIO.OUT, initial=GPIO.LOW)   # Set pin mode as output and turn off pump
+# Initialize LED
+GPIO.setup(LedPin, GPIO.OUT, initial=GPIO.LOW)   # Set pin mode as output and turn off LED
+# Initialize Button
+GPIO.setup(ButtonPin, GPIO.IN, pull_up_down=GPIO.PUD_UP)   # Set pin mode as input
+# Initialize Left limit switch
+GPIO.setup(LeftLim, GPIO.IN, pull_up_down=GPIO.PUD_UP)   # Set pin mode as input
+# Initialize Right limit switch
+GPIO.setup(RightLim, GPIO.IN, pull_up_down=GPIO.PUD_UP)   # Set pin mode as input
+
+global DATA_FILE
+global MOISTURE_THRESHOLD
+global NOAA_API_URL
+global data
+global response
+
+DATA_FILE = "light_log.csv"
+MOISTURE_THRESHOLD = 15  # Soil moisture threshold %
+NOAA_API_URL = "https://api.weather.gov/gridpoints/SEW/124,67/forecast"  # Replace with your local gridpoint
+
+
+try:
+    with open(DATA_FILE, 'x', newline='') as f:
+        writer = csv.writer(f)
+        writer.writerow(["Timestamp", "SoilMoisture", "Temperature", "Humidity", "MaxLightPercent"])
+except FileExistsError:
+    pass  # File already exists
+
+# Weather station at the PDX Airport
+latitude = '45.5958'
+longitude = '-122.6093'
+office = 'PQR'
+gridX = '115'
+gridY = '106'
+
+# URL and query elements for the NOAA Web site
+base_url = 'https://api.weather.gov/gridpoints/'
+full_url = base_url + office + '/' + gridX + ',' + gridY + '/forecast'
+
+def on_connect(client, userdata, flags, rc, properties=None):
+    print(f"MQTT Connection: {rc}")
+    client.subscribe(RPCrequestTopic)
+    client.publish(AttributesTopic, json.dumps(pump), 1) 
+    client.publish(AttributesTopic, json.dumps(Led), 1) 
+def publishJSON(data_out):
+    
+    # Convert data into JSON to send to MQTT server
+    # First format data as a dictionary
+    
+
+    print("data_out=",data_out)
+    JSON_data_out = json.dumps(data_out)    # Convert to JSON format
+    client.publish(TelemetryTopic, JSON_data_out, 0)
+    time.sleep(2)
+    print('---------------------------')
+
+def on_message(client, userdata, msg):
+    if msg.topic.startswith('v1/devices/me/rpc/request/'):
+        data = json.loads(msg.payload)
+        if data['method'] == 'setValue':
+            params = data['params']
+            # Turn the pump on/off
+            setValue(params)
+
+
+def on_message(client, userdata, msg):
+    if msg.topic.startswith('v1/devices/me/rpc/request/'):
+        data = json.loads(msg.payload)
+        if data['method'] == 'setValue':
+            params = data['params']
+            # Turn the pump on/off
+            setValue(params)
+       
+def getValue(params):
+
+    client.publish(AttributesTopic, json.dumps(pump), 1) 
+    client.publish(AttributesTopic, json.dumps(waterLevel),1)
+    client.publish(AttributesTopic, json.dumps(Led),1)
+    
+def setValue(params):
+    if params == True:
+        # Turn pump ON
+        pump_ON()
+        pump['PumpRunning'] = True
+        # Update the ClientAttribute "PumpRunning" on the TB dashboard
+        client.publish(AttributesTopic, json.dumps(pump), 1)
+
+    elif params == False:
+        # Turn pump OFF
+        pump_OFF()
+        pump['PumpRunning'] = False
+        # Update the ClientAttribute "PumpRunning" on the TB dashboard
+        client.publish(AttributesTopic, json.dumps(pump), 1)
+
+def check_weather_and_water():
+    """Check NOAA forecast and soil moisture, water if dry and no rain predicted."""
+    try:
+        # Get NOAA forecast
+        response = requests.get(NOAA_API_URL, timeout=10)
+        response.raise_for_status()
+        forecast_data = response.json()
+
+        # Determine if rain is predicted today
+        periods = forecast_data['properties']['periods']
+        rain_predicted = any('rain' in p['detailedForecast'].lower() for p in periods)
+
+        # Read current soil moisture
+        soil_moisture = read_SoilMoisture()
+        print(f"Soil moisture: {soil_moisture}% | Rain predicted: {rain_predicted}")
+
+        # Watering decision using Flowerpot_Engine pump functions
+        if rain_predicted:
+            print("Rain predicted today. Skipping watering.")
+            pump_OFF()
+        elif soil_moisture < MOISTURE_THRESHOLD:
+            print("Soil is dry and no rain predicted. Watering plant...")
+            pump_ON()
+            sleep(5)  # Water duration (adjust as needed)
+            pump_OFF()
+        else:
+            print("Soil moisture sufficient. No watering needed.")
+
+    except Exception as e:
+        print(f"Error checking weather or watering: {e}")
+
+
+
+def fetchweatherdata(): 
+    # GET the response from the NWS server
+    response = requests.get(full_url)
+
+    # Format the response object as JSON
+    global data, daytemp, sun
+    data = response.json()
+    daytemp = data['properties']['periods'][0]['temperature']
+    sun = data['properties']['periods'][0]['shortForecast']
+    return data,daytemp,sun
+
+
+
+def button_callback(ButtonPin):
+    # Read button
+    global ledON
+    if GPIO.input(ButtonPin) == False and not ledON:
+        # Button was pressed and LED was off
+        # Turn LED ON
+        print("  turn led ON .............")
+        ledON = led_ON()
+        time.sleep(1)
+    elif GPIO.input(ButtonPin) == False and ledON:
+        # Button was pressed and LED was already on
+        # Turn LED off
+        print("    turn led OFF .............")
+        ledON = led_OFF()
+        time.sleep(1)
+                
+
+# Set up event detection on the ButtonPin.  Signal goes low when button is pressed
+GPIO.add_event_detect(ButtonPin, GPIO.FALLING, callback=button_callback, bouncetime=100)
+
+
+def read_Light():
+    # Read light sensor (CH0 of the A/D)
+    raw_value = ADC.read(A0_chan)
+    # Convert into percentage
+    percentLight = round((raw_value/255)*100, 2)
+    return percentLight
+
+
+def read_WaterLevel():
+    # Read water level sensor (T/F)
+    if GPIO.input(WaterLevelPin):
+        return "full"
+    elif not GPIO.input(WaterLevelPin):
+        return "empty"
+     
+     
+def read_SoilMoisture():
+    # Read soil moisture sensor (CH1 of the A/D)
+    raw_value = ADC.read(A1_chan)
+    # Convert into percentage
+    percentSoilMoisture = round((raw_value/255)*100, 2)
+    return percentSoilMoisture
+
+
+def read_TempHum():
+    # Read the temprature and humidity from the AHT20 sensor
+    temperature = round(aht20.get_temperature(), 2)
+    humidity = round(aht20.get_humidity(), 2)
+    return temperature, humidity
+
+
+def pump_ON():
+    # Turn the pump on
+    GPIO.output(PumpPin, GPIO.HIGH)
+    return True
+
+
+def pump_OFF():
+    # Turn the pump off
+    GPIO.output(PumpPin, GPIO.LOW)
+    return False
+
+
+def led_ON():
+    # Turn the LED on
+    GPIO.output(LedPin, GPIO.HIGH)
+    return True
+
+
+def led_OFF():
+    # Turn the LED off
+    GPIO.output(LedPin, GPIO.LOW)
+    return False
+
+
+def read_LeftLim():
+    # Read Left limit switch (T/F)
+    if GPIO.input(LeftLim):
+        return True
+    elif not GPIO.input(LeftLim):
+        return False
+
+
+def read_RightLim():
+    # Read Right limit switch (T/F)
+    if GPIO.input(RightLim):
+        return True
+    elif not GPIO.input(RightLim):
+        return False
+
+
+def home_base():
+    # Rotate the base until the right limit switch is clicked.
+    # Then, rotate back 90 deg to the center of the range
+    while(not read_RightLim()):
+        # rotate the base until the right limit switch is triggered
+        motor.rotate(1, 'CW', 's', 'full')
+    
+    print("Right limit SW hit")
+    # Move back to center of the range
+    print("Moving back to center of the range")
+    time.sleep(1)
+    motor.rotate(90, 'CCW', 's', 'full')
+    return True
+            
+    
+def sweep_and_optimize_light(step_deg, sweep_delay):
+    
+    
+    STEP_DEG = 5
+    SWEEP_DELAY = 0.5
+    SWEEP_INTERVAL = 20*60
+    MAX_DEGREES = 90   
+    
+      # Motor physical limits
+    """Sweep motor across full ±90° range, find highest light, move back, log it."""
+    # Move to leftmost limit
+    motor_pos = 0
+    while motor_pos > -MAX_DEGREES and not read_LeftLim():
+        motor.rotate(step_deg, 'CCW', 's', 'full')
+        motor_pos -= step_deg
+        sleep(0.05)
+
+    # Sweep right while recording light
+    sweep_positions = []
+    sweep_lights = []
+    current_pos = motor_pos
+    while current_pos < MAX_DEGREES and not read_RightLim():
+        light = read_Light()
+        sweep_positions.append(current_pos)
+        sweep_lights.append(light)
+        motor.rotate(step_deg, 'CW', 's', 'full')
+        current_pos += step_deg
+        sleep(sweep_delay)
+
+    # Find max light position
+    max_index = sweep_lights.index(max(sweep_lights))
+    best_pos = sweep_positions[max_index]
+    max_light = sweep_lights[max_index]
+    SoilMoisture = read_SoilMoisture()
+    temperature = read_TempHum()[0]
+    humidity = read_TempHum()[1]
+    print(f"Max light {max_light}% at {best_pos}°")
+
+    # Move motor to best position
+    steps_to_move = best_pos - current_pos
+    if steps_to_move != 0:
+        direction = 'CW' if steps_to_move > 0 else 'CCW'
+        motor.rotate(abs(steps_to_move), direction, 's', 'full')
+        motor_pos = best_pos
+    print(f"Motor moved to optimal light position: {motor_pos}°")
+
+    # Log data to CSV
+    timestamp = strftime("%Y-%m-%d %H:%M:%S")
+    with open(DATA_FILE, 'a', newline='') as f:
+        writer = csv.writer(f)
+        writer.writerow([timestamp, max_light, SoilMoisture, temperature, humidity, ])
+    print(f"Logged data: {timestamp}, {max_light}, {SoilMoisture}, {temperature}, {humidity}%")
+    return max_light, timestamp
