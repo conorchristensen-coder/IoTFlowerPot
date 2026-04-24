@@ -95,7 +95,7 @@ last_watered_date = None
 try:
     i = 1
     while True:
-        
+        #Send data to ThingsBoard
         percentLight = read_Light()
         publishJSON({"Packet":i,"Light":percentLight})
         
@@ -111,26 +111,27 @@ try:
         hum = tempHum[1]
         publishJSON({"Packet":i,"Humidity":hum})
         
+        #Check Water Level and Soil Moisture
         if read_WaterLevel() == 'full' and read_SoilMoisture() <= 15:
             print(read_SoilMoisture())
-
-            if daytemp >= 65:
+            #If there is water to pump and moisture is low then:
+            if daytemp >= 65: #Check if it's a hot day. If it is then check if its sunny
                 if sun == 'Sunny' or sun == 'Mostly Sunny' or sun == 'Partly Sunny' or sun == 'Partly Clear' or sun == 'Mostly Clear' or sun == 'Clear':
                     pump_ON()
-                    sleep(10)
+                    sleep(10) #If sunny then pump water for a longer time
                     pump_OFF() 
-            else:
+            else: #If not a hot day or not sunny but moisture is low, turn pump on for a shorter time
                 pump_ON()
                 sleep(5)
                 pump_OFF()
-        elif read_WaterLevel() == 'empty':
+        elif read_WaterLevel() == 'empty': #If not water to pump, only print that we need water and turn on the warning light
             print('NEEDS WATER')
             Led["LedRunning"] = True
         else:
             print("WATER OK")
             Led["LedRunning"] = False
         
-        now = datetime.now()
+        now = datetime.now() #Check the time
 
         # Daily watering at 8 AM
         if now.hour == 8 and (last_watered_date != now.date()):
